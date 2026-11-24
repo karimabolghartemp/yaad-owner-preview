@@ -45,5 +45,31 @@ jobs:
           else:
               raise RuntimeError('Pages artifact did not become available.')
           PYTHON
-      - id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Deploy verified artifact through Pages API
+        id: deployment
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const listed = await github.rest.actions.listWorkflowRunArtifacts({owner, repo, run_id: context.runId});
+            const artifacts = listed.data.artifacts.filter(a => a.name === 'github-pages' && !a.expired);
+            if (artifacts.length !== 1) throw new Error('Expected one verified Pages artifact.');
+            const oidc = await core.getIDToken();
+            const created = await github.request('POST /repos/{owner}/{repo}/pages/deployments', {
+              owner, repo, artifact_id: artifacts[0].id,
+              pages_build_version: context.sha, oidc_token: oidc
+            });
+            core.setOutput('page_url', created.data.page_url);
+            const deploymentId = created.data.id || created.data.status_url.split('/').pop();
+            const failures = new Set(['deployment_failed', 'deployment_perms_error', 'deployment_content_failed', 'deployment_cancelled', 'deployment_lost']);
+            for (let attempt = 0; attempt < 84; attempt++) {
+              await new Promise(resolve => setTimeout(resolve, 5000));
+              const current = await github.request('GET /repos/{owner}/{repo}/pages/deployments/{deploymentId}', {owner, repo, deploymentId});
+              if (current.data.status === 'succeed') {
+                core.info('Public preview deployed successfully.');
+                return;
+              }
+              if (failures.has(current.data.status)) throw new Error('Pages status: ' + current.data.status);
+            }
+            await github.request('POST /repos/{owner}/{repo}/pages/deployments/{deploymentId}/cancel', {owner, repo, deploymentId});
+            throw new Error('Pages deployment timed out.');
