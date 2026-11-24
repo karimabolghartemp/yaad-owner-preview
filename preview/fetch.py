@@ -1,30 +1,17 @@
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-import hashlib, json, subprocess
-from urllib.parse import quote
+from pathlib import Path, PurePosixPath
+import hashlib,json,subprocess,stat
 from zipfile import ZipFile
-
-site = Path('_site')
-site.mkdir()
-with ZipFile('preview/overrides.zip') as overrides:
-    overrides.extractall(site)
-
-origin = "https://yaad-owner-review.netlify.app"
-assets = json.loads(Path('preview/assets.json').read_text())
-def copy_asset(item):
-    file, expected = item
-    url = origin + '/' + quote(file, safe='/')
-    modes = [[], ['--resolve', 'yaad-owner-review.netlify.app:443:75.2.60.5']]
-    for mode in modes:
-        result = subprocess.run(['curl', '-fsSL', '--retry', '2', '--connect-timeout', '8',
-            '--max-time', '45', *mode, url], capture_output=True)
-        if result.returncode == 0 and hashlib.sha256(result.stdout).hexdigest() == expected:
-            target = site / file
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(result.stdout)
-            return
-    raise RuntimeError('Could not verify hosted asset: ' + file)
-with ThreadPoolExecutor(max_workers=12) as pool:
-    for number, _ in enumerate(pool.map(copy_asset, assets.items()), 1):
-        if number % 100 == 0 or number == len(assets):
-            print(f'Verified {number}/{len(assets)} assets', flush=True)
+cfg=json.loads(Path('preview/release.json').read_text())
+archive=Path('preview-site.zip')
+subprocess.run(['curl','--fail','--location','--retry','3','--connect-timeout','15','--max-time','300',cfg['url'],'--output',str(archive)],check=True)
+if hashlib.sha256(archive.read_bytes()).hexdigest()!=cfg['sha256']:raise RuntimeError('Preview archive verification failed')
+expected=json.loads(Path('preview/assets.json').read_text());site=Path('_site');site.mkdir()
+with ZipFile(archive) as z:
+ if set(z.namelist())!=set(expected):raise RuntimeError('Unexpected archive files')
+ for entry in z.infolist():
+  name=PurePosixPath(entry.filename)
+  if name.is_absolute() or '..' in name.parts or stat.S_ISLNK(entry.external_attr>>16):raise RuntimeError('Invalid archive path')
+  data=z.read(entry)
+  if hashlib.sha256(data).hexdigest()!=expected[entry.filename]:raise RuntimeError('Invalid asset: '+entry.filename)
+  dest=site/entry.filename;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(data)
+print(f'Assembled and verified {len(expected)} public preview files')
